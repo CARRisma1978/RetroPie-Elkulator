@@ -1,0 +1,227 @@
+Elkulator patch 06: -autoboot / -autotype / -autodelay
+  -autoboot        SHIFT+BREAK shortly after power on (boots DFS/ADFS discs)
+  -autotype text   types text once the Electron has started;
+                   \n (backslash n) or | is RETURN, e.g. -autotype 'CHAIN""\n'
+  -autodelay n     frames (1/50 s) to wait before typing (default 50)
+Keys go straight into the emulated keyboard matrix, so typing does not
+depend on the PC keyboard layout, window focus or key_define remapping.
+
+diff --git a/src/elk.h b/src/elk.h
+index 2e63864..4fd0056 100644
+--- a/src/elk.h
++++ b/src/elk.h
+@@ -208,6 +208,7 @@ extern uint8_t sndstreambuf[626];
+ extern int sndstreamptr;
+ 
+ extern int autoboot;
++uint8_t autokeys_scan(uint16_t addr);
+ extern int sndint;
+ extern int sndddnoise,sndtape;
+ extern int ddvol,ddtype;
+diff --git a/src/main.c b/src/main.c
+index 904697c..8b8a383 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -70,11 +70,134 @@ extern int gotofullscreen;
+ #endif
+ char romnames[16][1024];
+ 
++/* Autoboot / autotype.
++   -autoboot        : hold SHIFT and press BREAK shortly after power on
++                      (boots a DFS or ADFS disc).
++   -autotype "text" : type text into the Electron once it has started,
++                      e.g. -autotype 'CHAIN""\n' to load a tape.
++                      \n (backslash n) or | types RETURN.
++   -autodelay n     : frames (1/50 s) to wait before typing (default 50).
++   Keys are pressed directly on the emulated keyboard matrix, so they are
++   independent of the PC keyboard layout and of key_define remapping. */
++#define AB_SHIFT_ON   10   /* frame: start holding SHIFT                */
++#define AB_BREAK      15   /* frame: press BREAK                        */
++#define AB_SHIFT_OFF  75   /* frame: release SHIFT                      */
++#define AT_DOWN        3   /* frames each key is held                   */
++#define AT_UP          3   /* frames between keys                       */
++
++static int elk_autoboot=0;
++static char autotype_buf[256];
++static int autotype_len=0,autotype_pos=0;
++static int autotype_delay=50;
++static int auto_frame=0,auto_start=0,auto_timer=0,auto_keydown=0;
++static int vk_col[2],vk_row[2],vk_n=0;
++static int ab_shift=0;
++
++/* Electron keyboard matrix: column = address line, row = data bit. */
++static int matrix_for_char(char ch, int *col, int *row, int *shift)
++{
++        static const char *cols[14]=
++        {
++                /* row0,row1,row2,row3 ; 0 = no key */
++                "\x01\x02\0 ",  /* RIGHT COPY - SPACE  (only SPACE used) */
++                "\x01\x02\r\x7f", /* LEFT DOWN RETURN DELETE           */
++                "-\x01:\0",     /* - UP : */
++                "0P;/",
++                "9OL.",
++                "8IK,",
++                "7UJM",
++                "6YHN",
++                "5TGB",
++                "4RFV",
++                "3EDC",
++                "2WSX",
++                "1QAZ",
++                "\0\0\0\0"
++        };
++        static const char *shifted_from="!\"#$%&'()@=*+<>?";
++        static const char *shifted_to  ="1234567890-:;,./";
++        const char *p;
++        int c,r;
++        *shift=0;
++        if (ch>='a' && ch<='z') ch-=32;   /* CAPS LOCK is on at power up */
++        p=strchr(shifted_from,ch);
++        if (ch && p) { ch=shifted_to[p-shifted_from]; *shift=1; }
++        if (ch==' ') { *col=0; *row=3; return 1; }
++        for (c=1;c<13;c++)
++        {
++                for (r=0;r<4;r++)
++                {
++                        if (cols[c][r]==ch && ch>' ') { *col=c; *row=r; return 1; }
++                        if (cols[c][r]=='\r' && ch=='\r') { *col=c; *row=r; return 1; }
++                }
++        }
++        return 0;
++}
++
++static void set_autotype(const char *src)
++{
++        int i=0;
++        autotype_len=0;
++        while (src[i] && autotype_len<(int)sizeof(autotype_buf)-1)
++        {
++                if (src[i]=='\\' && src[i+1]=='n') { autotype_buf[autotype_len++]='\r'; i+=2; }
++                else if (src[i]=='|' || src[i]=='\n') { autotype_buf[autotype_len++]='\r'; i++; }
++                else autotype_buf[autotype_len++]=src[i++];
++        }
++        autotype_buf[autotype_len]=0;
++        autotype_pos=0;
++}
++
++/* Called by readkeys(): extra key bits for the scanned columns. */
++uint8_t autokeys_scan(uint16_t addr)
++{
++        uint8_t temp=0;
++        int i;
++        if (ab_shift && !(addr&(1<<13))) temp|=1<<3;
++        for (i=0;i<vk_n;i++)
++            if (!(addr&(1<<vk_col[i]))) temp|=1<<vk_row[i];
++        return temp;
++}
++
++/* Called once per emulated frame. */
++static void autoboot_frame()
++{
++        if (!elk_autoboot && autotype_pos>=autotype_len && !auto_keydown) return;
++        auto_frame++;
++        if (elk_autoboot)
++        {
++                if (auto_frame==AB_SHIFT_ON) ab_shift=1;
++                if (auto_frame==AB_BREAK)    reset6502();
++                if (auto_frame>=AB_SHIFT_OFF) { ab_shift=0; elk_autoboot=0; }
++                auto_start=auto_frame+autotype_delay;
++                return;
++        }
++        if (auto_frame<auto_start) return;
++        if (auto_timer>0) { auto_timer--; return; }
++        if (auto_keydown)
++        {
++                vk_n=0; auto_keydown=0; auto_timer=AT_UP-1;
++                return;
++        }
++        while (autotype_pos<autotype_len)
++        {
++                int col,row,shift;
++                char ch=autotype_buf[autotype_pos++];
++                if (!matrix_for_char(ch,&col,&row,&shift)) continue;
++                vk_n=0;
++                vk_col[vk_n]=col; vk_row[vk_n]=row; vk_n++;
++                if (shift) { vk_col[vk_n]=13; vk_row[vk_n]=3; vk_n++; }
++                auto_keydown=1; auto_timer=AT_DOWN-1;
++                return;
++        }
++}
++
+ void initelk(int argc, char *argv[])
+ {
+         int c;
+         char *p;
+         int tapenext=0,discnext=0,romnext=-2,parallelnext=0,serialnext=0,serialdebugnext=0;
++        int autotypenext=0,autodelaynext=0;
+         get_executable_name(exedir,MAX_PATH_FILENAME_BUFFER_SIZE - 1);
+         p=get_filename(exedir);
+         p[0]=0;
+@@ -109,6 +232,9 @@ void initelk(int argc, char *argv[])
+                         printf("-rom number rom - load rom into the numbered bank\n");
+                         printf("-debug          - start debugger\n");
+                         printf("-fullscreen     - start in fullscreen mode\n");
++                        printf("-autoboot       - SHIFT+BREAK after power on (boot disc)\n");
++                        printf("-autotype text  - type text after start (\\n or | = RETURN)\n");
++                        printf("-autodelay n    - frames to wait before typing (default 50)\n");
+                         exit(-1);
+                 }
+                 else
+@@ -147,6 +273,29 @@ void initelk(int argc, char *argv[])
+                         gotofullscreen=1;
+                 }
+ #endif
++                else if (!strcasecmp(argv[c],"-autoboot"))
++                {
++                        elk_autoboot=1;
++                }
++                else if (!strcasecmp(argv[c],"-autotype"))
++                {
++                        autotypenext=1;
++                }
++                else if (!strcasecmp(argv[c],"-autodelay"))
++                {
++                        autodelaynext=1;
++                }
++                else if (autotypenext)
++                {
++                        set_autotype(argv[c]);
++                        autotypenext=0;
++                }
++                else if (autodelaynext)
++                {
++                        autotype_delay=atoi(argv[c]);
++                        if (autotype_delay<0) autotype_delay=0;
++                        autodelaynext=0;
++                }
+                 else if (!strcasecmp(argv[c],"-debug"))
+                 {
+                         debug=debugon=1;
+@@ -210,6 +359,7 @@ void initelk(int argc, char *argv[])
+             if (romnames[i][0] != 0) loadrom_n(i, romnames[i]);
+         }
+         if (defaultwriteprot) writeprot[0]=writeprot[1]=1;
++        auto_start=autotype_delay;
+ #ifndef WIN32
+         install_keyboard();
+ #endif
+@@ -262,6 +412,7 @@ void runelk()
+                 if (wantsavestate) dosavestate();
+                 if (infocus) poll_joystick();
+                 if (autoboot) autoboot--;
++                autoboot_frame();
+                 ddnoiseframes++;
+                 if (ddnoiseframes>=5)
+                 {
+diff --git a/src/mem.c b/src/mem.c
+index 066c7b2..57f34f2 100644
+--- a/src/mem.c
++++ b/src/mem.c
+@@ -402,6 +402,7 @@ uint8_t readkeys(uint16_t addr)
+         }
+   //      if (autoboot && !(addr&(1<<(keyl[KEY_LSHIFT]&15)))) temp|=1<<((keyl[keylookup[KEY_LSHIFT]]&0x30)>>4);
+ //        rpclog("Readkey %i %04X %02X %02X %04X\n",autoboot,addr,temp,keyl[KEY_LSHIFT],1<<(keyl[KEY_LSHIFT]&15));
++        temp|=autokeys_scan(addr);
+ /*        for (c=0;c<14;c++)
+         {
+                 if (!(addr&(1<<c)))

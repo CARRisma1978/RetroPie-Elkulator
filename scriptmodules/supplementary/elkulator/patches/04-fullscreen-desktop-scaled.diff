@@ -1,0 +1,266 @@
+Elkulator patch 04: working fullscreen on modern X servers
+Fullscreen asked for an 800x600 video mode via XF86VidMode, which the
+Raspberry Pi KMS/modesetting X driver cannot provide, so the picture sat
+unscaled in the corner of the screen. Fullscreen is now a borderless
+window the size of the desktop (no video mode switch, so it also works
+when the launcher halves the resolution with xrandr --scale), and the
+640x512 picture is scaled to fit:
+  elk.cfg  fullscreen_scale = 0  largest whole-number scale (default, sharp)
+                              1  4:3 aspect
+                              2  fill the screen
+  elk.cfg  display_scale = 2     read by the RetroPie launcher:
+                                 2 = X at half the TV resolution, doubled
+                                     by the display (menus twice the size)
+                                 1 = X at the full TV resolution
+                                 (Elkulator itself only keeps the value)
+Adds the -fullscreen command line option to start in fullscreen.
+
+diff --git a/src/config.c b/src/config.c
+index abc759a..c17eb83 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -127,6 +127,8 @@ void loadconfig()
+         sndtape=getintcfg("sound_tape",0);
+         
+         videoresize=getintcfg("win_resize",0);
++        fs_scale=getintcfg("fullscreen_scale",0);
++        display_scale=getintcfg("display_scale",2);
+         
+         firstbyte=getintcfg("joy_firstbyte",0);
+         
+@@ -180,6 +182,8 @@ void saveconfig()
+         writeintcfg("sound_tape",sndtape);
+ 
+         writeintcfg("win_resize",videoresize);
++        writeintcfg("fullscreen_scale",fs_scale);
++        writeintcfg("display_scale",display_scale);
+         
+         writeintcfg("joy_firstbyte",firstbyte);
+         
+diff --git a/src/elk.h b/src/elk.h
+index 0c34b23..14cedd9 100644
+--- a/src/elk.h
++++ b/src/elk.h
+@@ -270,6 +270,8 @@ void intula(uint8_t num);
+ void clearintula(uint8_t num);
+ void receive(uint8_t val);
+ void enterfullscreen();
++extern int fs_scale;
++extern int display_scale;
+ void leavefullscreen();
+ void clearall();
+ void clearscreen();
+diff --git a/src/linux.c b/src/linux.c
+index 6eb2c82..45262cd 100644
+--- a/src/linux.c
++++ b/src/linux.c
+@@ -51,6 +51,12 @@ int main(int argc, char *argv[])
+         }
+         initelk(argc,argv);
+         set_close_button_callback(native_window_close_button_handler);
++        if (gotofullscreen)
++        {
++                gotofullscreen=0;
++                fullscreen=1;
++                enterfullscreen();
++        }
+         install_mouse();
+         while (!quited)
+         {
+diff --git a/src/main.c b/src/main.c
+index 3b15271..904697c 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -65,6 +65,9 @@ char tapename[512];
+ char parallelname[512];
+ char serialname[512];
+ extern int serial_debug;
++#ifndef WIN32
++extern int gotofullscreen;
++#endif
+ char romnames[16][1024];
+ 
+ void initelk(int argc, char *argv[])
+@@ -105,6 +108,7 @@ void initelk(int argc, char *argv[])
+                         printf("-serialdebug n  - set serial debugging output level to n\n");
+                         printf("-rom number rom - load rom into the numbered bank\n");
+                         printf("-debug          - start debugger\n");
++                        printf("-fullscreen     - start in fullscreen mode\n");
+                         exit(-1);
+                 }
+                 else
+@@ -137,6 +141,12 @@ void initelk(int argc, char *argv[])
+                 {
+                         serialdebugnext=1;
+                 }
++#ifndef WIN32
++                else if (!strcasecmp(argv[c],"-fullscreen"))
++                {
++                        gotofullscreen=1;
++                }
++#endif
+                 else if (!strcasecmp(argv[c],"-debug"))
+                 {
+                         debug=debugon=1;
+diff --git a/src/ula.c b/src/ula.c
+index 6baac38..b32c3d7 100644
+--- a/src/ula.c
++++ b/src/ula.c
+@@ -117,28 +117,112 @@ void initula()
+ 
+ int fullblit=0;
+ 
++/* Scaled fullscreen (Linux).
++   Allegro 4 changes resolution with XF86VidMode, which modern X servers
++   (e.g. the Raspberry Pi KMS/modesetting driver) no longer support, so the
++   old 800x600 request left a small picture in the corner of a full-size
++   screen.  Instead, fullscreen now uses the current desktop resolution and
++   scales the 640x512 picture to fit.
++   fullscreen_scale (elk.cfg): 0 = largest integer scale (sharp, default)
++                               1 = 4:3 aspect
++                               2 = fill the whole screen */
++int fs_scale=0;
++/* display_scale (elk.cfg): not used by Elkulator itself - the RetroPie
++   launcher reads it.  2 = X runs at half the TV resolution, doubled by the
++   display (menus twice the size); 1 = full TV resolution. */
++int display_scale=2;
++static int fs_active=0;
++static int fs_x=0,fs_y=0,fs_w=640,fs_h=512;
++static BITMAP *fsbuf=NULL;
++
++static void elk_present(BITMAP *src)
++{
++        if (!fs_active)
++        {
++                blit(src,screen,0,0,(winsizex-640)/2,(winsizey-512)/2,640,512);
++                return;
++        }
++        if (bitmap_color_depth(src)!=bitmap_color_depth(screen))
++        {
++                blit(src,fsbuf,0,0,0,0,640,512);
++                src=fsbuf;
++        }
++        if (fs_w==640 && fs_h==512) blit(src,screen,0,0,fs_x,fs_y,640,512);
++        else                        stretch_blit(src,screen,0,0,640,512,fs_x,fs_y,fs_w,fs_h);
++}
++
++#ifndef WIN32
++static void calc_fs_rect(int dw, int dh)
++{
++        int k;
++        switch (fs_scale)
++        {
++                case 2: /* fill */
++                fs_w=dw; fs_h=dh;
++                break;
++                case 1: /* 4:3 */
++                fs_h=dh; fs_w=(dh*4)/3;
++                if (fs_w>dw) { fs_w=dw; fs_h=(dw*3)/4; }
++                break;
++                default: /* integer */
++                k=dw/640;
++                if (dh/512<k) k=dh/512;
++                if (k<1) k=1;
++                fs_w=640*k; fs_h=512*k;
++                break;
++        }
++        fs_x=(dw-fs_w)/2;
++        fs_y=(dh-fs_h)/2;
++}
++#endif
++
+ void enterfullscreen()
+ {
+         #ifdef WIN32
+         destroy_bitmap(vidb);
+-        #endif
+         set_color_depth(desktop_color_depth());
+         set_gfx_mode(GFX_AUTODETECT_FULLSCREEN,800,600,0,0);
+-        #ifdef WIN32
+         vp1=create_video_bitmap(800,600);
+         vp2=create_video_bitmap(800,600);
+         show_video_bitmap(vp2);
+         vidb=create_video_bitmap(800,300);
+         clear(vidb);
+         install_mouse();
+-        #endif
+         set_color_depth(8);
+         set_palette(elkpal);
+         winsizex=800; winsizey=600;
++        #else
++        int dw=0,dh=0;
++        if (get_desktop_resolution(&dw,&dh)!=0 || dw<640 || dh<512)
++        {
++                dw=640; dh=512;
++        }
++        set_color_depth(desktop_color_depth());
++        /* A borderless desktop-sized window rather than Allegro's
++           "fullscreen" driver, which tries an XF86VidMode mode switch.
++           That switch fails (and X aborts the program) when the desktop
++           size is not a real video mode, e.g. with xrandr --scale. */
++        if (set_gfx_mode(GFX_AUTODETECT_WINDOWED,dw,dh,0,0)!=0)
++        {
++                set_gfx_mode(GFX_AUTODETECT_WINDOWED,640,512,0,0);
++                winsizex=640; winsizey=512;
++                set_color_depth(8);
++                set_palette(elkpal);
++                return;
++        }
++        if (!fsbuf) fsbuf=create_bitmap(640,512);
++        calc_fs_rect(SCREEN_W,SCREEN_H);
++        clear_to_color(screen,makecol(0,0,0));
++        fs_active=1;
++        set_color_depth(8);
++        set_palette(elkpal);
++        winsizex=SCREEN_W; winsizey=SCREEN_H;
++        #endif
+ }
+ 
+ void leavefullscreen()
+ {
++        fs_active=0;
+         #ifdef WIN32
+         remove_mouse();
+         destroy_bitmap(vidb);
+@@ -796,7 +880,7 @@ void yield()
+                                                 switch (drawmode)
+                                                 {
+                                                         case SCANLINES:
+-                                                        blit(b,screen,0,0,(winsizex-640)/2,(winsizey-512)/2,640,512);
++                                                        elk_present(b);
+                                                         break;
+                                                         case LINEDBL:
+                                                         #ifdef WIN32
+@@ -805,27 +889,27 @@ void yield()
+                                                         else             stretch_blit(vidb,screen,0,0,640,256,(winsizex-640)/2,(winsizey-512)/2,640,512);
+                                                         #else
+                                                         for (c=0;c<512;c++) blit(b,b16,0,c>>1,0,c,640,1);
+-                                                        blit(b16,screen,0,0,(winsizex-640)/2,(winsizey-512)/2,640,512);
++                                                        elk_present(b16);
+                                                         #endif
+                                                         break;
+                                                         case _2XSAI:
+                                                         blit(b,b162,0,0,0,0,640,256);
+                                                         Super2xSaI(b162,b16,0,0,0,0,320,256);
+-                                                        blit(b16,screen,0,0,(winsizex-640)/2,(winsizey-512)/2,640,512);
++                                                        elk_present(b16);
+                                                         break;
+                                                         case SCALE2X:
+                                                         blit(b,b162,0,0,0,0,640,256);
+                                                         scale2x(b162,b16,320,256);
+-                                                        blit(b16,screen,0,0,(winsizex-640)/2,(winsizey-512)/2,640,512);
++                                                        elk_present(b16);
+                                                         break;
+                                                         case EAGLE:
+                                                         blit(b,b162,0,0,0,0,640,256);
+                                                         SuperEagle(b162,b16,0,0,0,0,320,256);
+-                                                        blit(b16,screen,0,0,(winsizex-640)/2,(winsizey-512)/2,640,512);
++                                                        elk_present(b16);
+                                                         break;
+                                                         case PAL:
+                                                         palfilter(b,b16,coldepth);
+-                                                        blit(b16,screen,0,0,(winsizex-640)/2,(winsizey-512)/2,640,512);
++                                                        elk_present(b16);
+                                                         break;
+                                                 }
+                                                 if (wantsavescrshot) dosavescrshot();

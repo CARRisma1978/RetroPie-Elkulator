@@ -1,0 +1,101 @@
+Elkulator patch 03: remove the ALUT dependency
+ALUT (freealut) is deprecated. Elkulator only used alutInit()/alutExit()
+to open the audio device, so this opens it with core OpenAL (ALC) calls
+instead and drops -lalut from the build.
+
+diff --git a/configure.ac b/configure.ac
+index fc0d6b8..df30219 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -44,9 +44,6 @@ AC_CHECK_LIB([z], [gzopen], [], \
+ AC_CHECK_LIB([openal], [alGetError], [], \
+ 	[echo "You need to install the OpenAL library."
+ 	 exit -1])
+-AC_CHECK_LIB([alut], [alutInit], [], \
+-   [echo "You need to install the ALUT library."
+-    exit -1])
+ 
+ AC_CHECK_LIB([m], [sin])
+ 
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 87f8188..4ced567 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -14,9 +14,9 @@ elkulator_CFLAGS = $(allegro_CFLAGS) -Wno-unused-result
+ 
+ # workaround for Win32 Allegro, which has `allegro-config' missing
+ if OS_WIN
+-elkulator_LDADD = -lalleg -lz -lopenal -lalut
++elkulator_LDADD = -lalleg -lz -lopenal
+ else
+-elkulator_LDADD = $(allegro_LIBS) -lz -lopenal -lalut -lz
++elkulator_LDADD = $(allegro_LIBS) -lz -lopenal -lz
+ endif
+ 
+ elkulator_SOURCES = 2xsai.c 1770.c 6502.c adc.c adf.c config.c csw.c ddnoise.c \
+diff --git a/src/soundopenal.c b/src/soundopenal.c
+index a74271b..ac3e483 100644
+--- a/src/soundopenal.c
++++ b/src/soundopenal.c
+@@ -3,7 +3,8 @@
+   
+ #include <stdio.h>
+ #include <AL/al.h>
+-#include <AL/alut.h>
++#include <AL/alc.h>
++#include <stdlib.h>
+ #include <stdint.h>
+ #include <string.h>
+ #include "elk.h"
+@@ -32,26 +33,41 @@ void check()
+                 printf("AL Error : %08X\n", error);
+                 //printf("Description : %s\n",alGetErrorString(error));
+         }
+-/*        if ((error = alutGetError()) != ALUT_ERROR_NO_ERROR)
+-        {
+-                printf("ALut Error : %08X\n", error);
+-                printf("Description : %s\n",alutGetErrorString(error));
+-        }*/
+ }
+ 
++static ALCdevice  *al_device  = NULL;
++static ALCcontext *al_context = NULL;
++
++/* Open the default OpenAL device directly (replaces deprecated ALUT). */
+ void initalmain(int argc, char *argv[])
+ {
+-printf("Start...\n");
+-        alutInit(0,0);
++        al_device = alcOpenDevice(NULL);
++        if (!al_device)
++        {
++                fprintf(stderr, "OpenAL: unable to open default audio device\n");
++                return;
++        }
++        al_context = alcCreateContext(al_device, NULL);
++        if (!al_context || !alcMakeContextCurrent(al_context))
++        {
++                fprintf(stderr, "OpenAL: unable to create audio context\n");
++                if (al_context) alcDestroyContext(al_context);
++                alcCloseDevice(al_device);
++                al_context = NULL;
++                al_device  = NULL;
++                return;
++        }
+         check();
+-printf("End!\n");
+         atexit(closeal);
+-        printf("AlutInit\n");
+ }
+ 
+ void closeal()
+ {
+-        alutExit();
++        alcMakeContextCurrent(NULL);
++        if (al_context) alcDestroyContext(al_context);
++        if (al_device)  alcCloseDevice(al_device);
++        al_context = NULL;
++        al_device  = NULL;
+ }
+ 
+ int16_t tempbuf[BUFLEN>>1];

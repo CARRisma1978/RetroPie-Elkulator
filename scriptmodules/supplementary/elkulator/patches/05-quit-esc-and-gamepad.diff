@@ -1,0 +1,133 @@
+Elkulator patch 05: quit with ESC or a gamepad button combination
+ESC on the PC keyboard quits (the Electron's ESCAPE is remapped to F1 in
+elk.cfg). ESC used to close the F11 menu does not quit.
+  elk.cfg  joy_quit_buttons = 10,11   buttons held together to quit
+                                      (8BitDo M30: Select + Start)
+Settings are saved on exit as usual.
+
+diff --git a/src/config.c b/src/config.c
+index c17eb83..d2f71ba 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -17,6 +17,7 @@ int joffset;
+ int enable_mgc;
+ int enable_db_flash_cartridge;
+ int enable_jim;
++char joy_quit_buttons[64]="";
+ 
+ char *getstringcfg(char *name)
+ {
+@@ -134,6 +135,10 @@ void loadconfig()
+         
+         joffset=getintcfg("joy_offset",0);
+ 
++        s=getstringcfg("joy_quit_buttons");
++        if (s) { strncpy(joy_quit_buttons,s,sizeof(joy_quit_buttons)-1); joy_quit_buttons[sizeof(joy_quit_buttons)-1]=0; }
++        else     joy_quit_buttons[0]=0;
++
+         for (c=0;c<128;c++)
+         {
+                 sprintf(s2,"key_define_%03i",c);
+@@ -188,6 +193,7 @@ void saveconfig()
+         writeintcfg("joy_firstbyte",firstbyte);
+         
+         writeintcfg("joy_offset",joffset);
++        writestringcfg("joy_quit_buttons",joy_quit_buttons);
+         
+         for (c=0;c<128;c++)
+         {
+diff --git a/src/elk.h b/src/elk.h
+index 14cedd9..2e63864 100644
+--- a/src/elk.h
++++ b/src/elk.h
+@@ -272,6 +272,7 @@ void receive(uint8_t val);
+ void enterfullscreen();
+ extern int fs_scale;
+ extern int display_scale;
++extern char joy_quit_buttons[64];
+ void leavefullscreen();
+ void clearall();
+ void clearscreen();
+diff --git a/src/linux.c b/src/linux.c
+index 45262cd..2751c98 100644
+--- a/src/linux.c
++++ b/src/linux.c
+@@ -3,6 +3,8 @@
+ #ifndef WIN32
+ 
+ #include <allegro.h>
++#include <stdlib.h>
++#include <string.h>
+ #include "elk.h"
+ 
+ char ssname[260];
+@@ -41,6 +43,43 @@ void endblit()
+ 
+ int keylookup[128];
+ 
++/* Quit keys: ESC on the PC keyboard (the Electron's ESCAPE is normally
++   remapped to F1 in elk.cfg), or a gamepad button combination given in
++   elk.cfg as joy_quit_buttons = 10,11 (all listed buttons held together
++   on any one joystick).  Empty disables the gamepad combination. */
++#define MAX_QUIT_BUTTONS 8
++static int quit_buttons[MAX_QUIT_BUTTONS];
++static int num_quit_buttons=0;
++
++static void parse_quit_buttons()
++{
++        char tmp[64];
++        char *tok;
++        strncpy(tmp,joy_quit_buttons,sizeof(tmp)-1);
++        tmp[sizeof(tmp)-1]=0;
++        num_quit_buttons=0;
++        for (tok=strtok(tmp,", ");tok && num_quit_buttons<MAX_QUIT_BUTTONS;tok=strtok(NULL,", "))
++        {
++                int b=atoi(tok);
++                if (b>=0 && b<MAX_JOYSTICK_BUTTONS) quit_buttons[num_quit_buttons++]=b;
++        }
++}
++
++static int joy_quit_pressed()
++{
++        int j,c;
++        if (!num_quit_buttons) return 0;
++        for (j=0;j<num_joysticks;j++)
++        {
++                for (c=0;c<num_quit_buttons;c++)
++                {
++                        if (quit_buttons[c]>=joy[j].num_buttons || !joy[j].button[quit_buttons[c]].b) break;
++                }
++                if (c==num_quit_buttons) return 1;
++        }
++        return 0;
++}
++
+ int main(int argc, char *argv[])
+ {
+         int ret = allegro_init();
+@@ -58,10 +97,22 @@ int main(int argc, char *argv[])
+                 enterfullscreen();
+         }
+         install_mouse();
+-        while (!quited)
++        parse_quit_buttons();
+         {
+-                runelk();
+-                if (menu_pressed()) entergui();
++                int esc_prev=key[KEY_ESC];
++                while (!quited)
++                {
++                        runelk();
++                        if (menu_pressed())
++                        {
++                                entergui();
++                                /* ESC may have been used to close the menu */
++                                esc_prev=1;
++                        }
++                        if (key[KEY_ESC] && !esc_prev) quited=1;
++                        esc_prev=key[KEY_ESC];
++                        if (joy_quit_pressed()) quited=1;
++                }
+         }
+         closeelk();
+         return 0;
